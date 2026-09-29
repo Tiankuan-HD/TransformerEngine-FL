@@ -174,9 +174,10 @@ class GroupedTensor(GroupedTensorStorage, torch.Tensor):
         )
         return instance
 
+    ######## FlagScale Begin ########
     # NPU patch: GroupedTensor is a storage-less wrapper. Its real payload is
     # held by rowwise_data/columnwise_data, so the wrapper has no data pointer.
-    ######## FlagScale Begin ########
+
     def data_ptr(self) -> int:
         """Return the null pointer expected for a storage-less tensor wrapper."""
         return 0
