@@ -61,6 +61,14 @@ run_pytest_step_with_unfused_attention() {
 run_pytest_step "Ascend vendor NPU backend tests" "pytest_ascend_vendor_npu.xml" false \
     "$TE_PATH/tests/plugin/backend/npu/test_backend_npu.py"
 
+run_pytest_step "NPU cuDNN capability tests" "pytest_npu_cudnn_version.xml" false \
+    "$TE_PATH/tests/plugin/backend/npu/test_get_cudnn_version.py" \
+    -o junit_family=xunit1
+
+run_pytest_step "NPU tensor scale tests" "pytest_npu_tensor_scale.xml" false \
+    "$TE_PATH/tests/plugin/backend/npu/test_multi_tensor_scale_tensor.py" \
+    -o junit_family=xunit1
+
 PLUGIN_TEST_ROOT="$TE_PATH/tests/plugin"
 
 run_pytest_step "plugin policy" "pytest_test_plugin_policy.xml" false \
