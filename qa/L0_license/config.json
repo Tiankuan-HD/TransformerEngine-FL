@@ -21,6 +21,9 @@
                 ".md",
                 ".txt"
                ],
-    "exclude_copyright": [],
+    "exclude_copyright": [
+        "tests/plugin/backend/npu/test_get_cudnn_version.py",
+        "tests/plugin/backend/npu/test_multi_tensor_scale_tensor.py"
+    ],
     "copyright_only": false
 }

@@ -89,6 +89,10 @@ class NPUBackend(TEFLBackendBase):
     def is_available(self) -> bool:
         return _check_npu_available()
 
+    def get_cudnn_version(self) -> int:
+        """Return zero because cuDNN is not available on Ascend NPU."""
+        return 0
+
     # ===================== Attention =====================
 
     def get_attention_backend(self, attention_params=None):
@@ -327,6 +331,17 @@ class NPUBackend(TEFLBackendBase):
         """Multi-tensor scale."""
         opt = _get_tenpu_optimizers()
         opt.multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale)
+
+    def multi_tensor_scale_tensor(
+        self,
+        chunk_size: int,
+        noop_flag: torch.Tensor,
+        tensor_lists: List[List[torch.Tensor]],
+        scale: torch.Tensor,
+    ) -> None:
+        """Multi-tensor scale with a tensor-valued scaling factor."""
+        opt = _get_tenpu_optimizers()
+        return opt.multi_tensor_scale_tensor(chunk_size, noop_flag, tensor_lists, scale)
 
     def multi_tensor_l2norm(
         self,
