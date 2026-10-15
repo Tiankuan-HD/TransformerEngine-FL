@@ -357,6 +357,8 @@ class NPUBackend(TEFLBackendBase):
         opt.multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale)
 
     # NPU backend adaptation: keep the tensor scale on device and use ACLNN AMP foreach.
+
+    @torch.no_grad()
     def multi_tensor_scale_tensor(
         self,
         chunk_size: int,
@@ -364,120 +366,47 @@ class NPUBackend(TEFLBackendBase):
         tensor_lists: List[List[torch.Tensor]],
         scale: torch.Tensor,
     ) -> None:
-        """Scale tensor lists with a device-resident scalar and report non-finites.
-
-        TE-FL's CUDA kernel checks the source values for Inf/NaN, always writes
-        the scaled result, and only changes the overflow flag from zero to one.
-        On Inf/NaN-capable NPU stacks, the ATen AMP foreach primitive dispatches
-        to ``aclnnForeachNonFiniteCheckAndUnscale`` for the same-dtype case.
-        Mixed-dtype output is composed from device operations because the ACLNN
-        primitive is in-place and accepts one homogeneous tensor list.
-        """
-
-        del chunk_size  # ACLNN partitions long tensor lists internally.
         if len(tensor_lists) != 2:
-            raise ValueError(
-                "multi_tensor_scale_tensor expects [input_tensors, output_tensors], "
-                f"got {len(tensor_lists)} tensor lists"
-            )
-        input_tensors, output_tensors = tensor_lists
-        if len(input_tensors) != len(output_tensors):
-            raise ValueError(
-                "multi_tensor_scale_tensor input and output lists must have the same length"
-            )
-        if not input_tensors:
+            raise AssertionError("tensor_lists must contain 2 lists")
+
+        inputs, outputs = tensor_lists
+
+        if len(inputs) != len(outputs):
+            raise AssertionError("input/output tensor counts must match")
+
+        valid_pairs = [(x, y) for x, y in zip(inputs, outputs) if x.numel() > 0]
+
+        if not valid_pairs:
             return
 
-        if scale.numel() != 1 or scale.dtype != torch.float32:
-            raise ValueError(
-                "multi_tensor_scale_tensor scale must be a one-element FP32 tensor"
-            )
-        if noop_flag.numel() != 1 or noop_flag.dtype != torch.int32:
-            raise ValueError(
-                "multi_tensor_scale_tensor overflow flag must be a one-element INT32 tensor"
-            )
+        found_inf = noop_flag.to(torch.float32)
 
-        device = input_tensors[0].device
-        input_dtype = input_tensors[0].dtype
-        output_dtype = output_tensors[0].dtype
-        supported_dtypes = (torch.float32, torch.float16, torch.bfloat16)
-        if device.type != "npu":
-            raise ValueError("multi_tensor_scale_tensor inputs must be NPU tensors")
-        if scale.device != device or noop_flag.device != device:
-            raise ValueError(
-                "multi_tensor_scale_tensor scale, overflow flag, and tensors must be "
-                "on the same NPU device"
-            )
-        if input_dtype not in supported_dtypes or output_dtype not in supported_dtypes:
-            raise TypeError(
-                "multi_tensor_scale_tensor supports FP32, FP16, and BF16 tensors"
-            )
-
-        copy_inputs: list[torch.Tensor] = []
-        copy_outputs: list[torch.Tensor] = []
-        for index, (input_tensor, output_tensor) in enumerate(
-            zip(input_tensors, output_tensors)
-        ):
-            if input_tensor.device != device or output_tensor.device != device:
-                raise ValueError(
-                    "multi_tensor_scale_tensor tensors must all be on the same NPU device"
-                )
-            if input_tensor.dtype != input_dtype or output_tensor.dtype != output_dtype:
-                raise TypeError(
-                    "multi_tensor_scale_tensor requires one dtype per input/output list"
-                )
-            if input_tensor.shape != output_tensor.shape:
-                raise ValueError(
-                    "multi_tensor_scale_tensor input/output shapes differ at index "
-                    f"{index}: {tuple(input_tensor.shape)} != {tuple(output_tensor.shape)}"
-                )
-            if not input_tensor.is_contiguous() or not output_tensor.is_contiguous():
-                raise ValueError(
-                    "multi_tensor_scale_tensor requires contiguous input and output tensors"
-                )
-            if input_tensor.data_ptr() != output_tensor.data_ptr():
-                copy_inputs.append(input_tensor)
-                copy_outputs.append(output_tensor)
-
-        torch_npu = _get_torch_npu()
-        npu_utils = getattr(getattr(torch_npu, "npu", None), "utils", None)
-        inf_nan_capability = getattr(npu_utils, "is_support_inf_nan", None)
-        supports_inf_nan = (
-            bool(inf_nan_capability()) if inf_nan_capability is not None else False
+        common_dtype = valid_pairs[0][0].dtype
+        need_fp32_temp = any(
+            x.dtype != common_dtype or y.dtype != common_dtype for x, y in valid_pairs
         )
-        same_dtype = input_dtype == output_dtype
 
-        with torch.no_grad():
-            if supports_inf_nan and same_dtype:
-                # The ACLNN primitive is in-place. Copy only genuinely
-                # out-of-place pairs, preserving caller-owned output storage.
-                if copy_outputs:
-                    torch._foreach_copy_(copy_outputs, copy_inputs, non_blocking=True)
-                found_inf = torch.zeros(1, dtype=torch.float32, device=device)
-                torch._amp_foreach_non_finite_check_and_unscale_(
-                    output_tensors,
-                    found_inf,
-                    scale,
-                )
-            else:
-                # The saturation-mode torch_npu fallback synchronizes the host
-                # and skips scaling after a non-finite value. Compose the CUDA
-                # contract on device instead. For mixed dtype, convert the
-                # source to FP32 before multiplication and cast only on write.
-                all_finite = torch.ones((), dtype=torch.bool, device=device)
-                scale_scalar = scale.reshape(())
-                for input_tensor in input_tensors:
-                    all_finite.logical_and_(torch.isfinite(input_tensor).all())
-                for input_tensor, output_tensor in zip(input_tensors, output_tensors):
-                    output_tensor.copy_(input_tensor.float() * scale_scalar)
-                found_inf = (
-                    torch.logical_not(all_finite).to(dtype=torch.float32).reshape(1)
-                )
+        if need_fp32_temp:
+            grads = [x.to(dtype=torch.float32, copy=True) for x, _ in valid_pairs]
 
-            # CUDA treats this as a sticky output flag rather than a no-op input.
-            noop_flag.copy_(
-                torch.maximum(noop_flag, found_inf.to(dtype=noop_flag.dtype))
-            )
+        else:
+            for x, y in valid_pairs:
+                if x is not y:
+                    y.copy_(x)
+
+            grads = [y for _, y in valid_pairs]
+
+        torch._amp_foreach_non_finite_check_and_unscale_(
+            grads,
+            found_inf,
+            scale,
+        )
+
+        if need_fp32_temp:
+            for grad, (_, y) in zip(grads, valid_pairs):
+                y.copy_(grad)
+
+        noop_flag.copy_(found_inf)
 
     def multi_tensor_l2norm(
         self,
@@ -550,10 +479,7 @@ class NPUBackend(TEFLBackendBase):
                 if mode == 0:
                     grad_fp32 = grad_fp32 + weight_decay * param_fp32
                 next_exp_avg = beta1 * exp_avg.float() + (1.0 - beta1) * grad_fp32
-                next_exp_avg_sq = (
-                    beta2 * exp_avg_sq.float()
-                    + (1.0 - beta2) * grad_fp32 * grad_fp32
-                )
+                next_exp_avg_sq = beta2 * exp_avg_sq.float() + (1.0 - beta2) * grad_fp32 * grad_fp32
                 update = next_exp_avg / (next_exp_avg_sq.sqrt() + epsilon)
                 if mode == 1:
                     update = update + weight_decay * param_fp32
@@ -601,9 +527,7 @@ class NPUBackend(TEFLBackendBase):
                     exp_avg if exp_avg.dtype == torch.float32 else exp_avg.detach().float()
                 )
                 work_exp_avg_sq = (
-                    exp_avg_sq
-                    if exp_avg_sq.dtype == torch.float32
-                    else exp_avg_sq.detach().float()
+                    exp_avg_sq if exp_avg_sq.dtype == torch.float32 else exp_avg_sq.detach().float()
                 )
 
             fused_grad = (
@@ -941,9 +865,7 @@ class NPUBackend(TEFLBackendBase):
             if not isinstance(first_dims, torch.Tensor):
                 raise TypeError(f"{name}.first_dims must be a torch.Tensor or None")
             if first_dims.dtype != torch.int64 or first_dims.numel() != num_tensors:
-                raise ValueError(
-                    f"{name}.first_dims must be int64 with {num_tensors} elements"
-                )
+                raise ValueError(f"{name}.first_dims must be int64 with {num_tensors} elements")
             if first_dims.device != data.device:
                 raise ValueError(f"{name}.first_dims and rowwise_data must share a device")
             group_sizes = first_dims.contiguous().view(-1)
@@ -968,8 +890,7 @@ class NPUBackend(TEFLBackendBase):
                 raise TypeError(f"{name} must have dtype torch.float32")
             if coefficient.numel() not in (1, num_tensors):
                 raise ValueError(
-                    f"{name} must contain 1 or {num_tensors} values, "
-                    f"got {coefficient.numel()}"
+                    f"{name} must contain 1 or {num_tensors} values, got {coefficient.numel()}"
                 )
         if alpha.numel() != beta.numel():
             raise ValueError("alpha and beta must contain the same number of values")
@@ -1036,9 +957,7 @@ class NPUBackend(TEFLBackendBase):
             )
 
         b_data, b_shape, b_group_sizes, num_tensors = self._dense_grouped_tensor_parts(B, "B")
-        d_data, d_shape, d_group_sizes, _ = self._dense_grouped_tensor_parts(
-            D, "D", num_tensors
-        )
+        d_data, d_shape, d_group_sizes, _ = self._dense_grouped_tensor_parts(D, "D", num_tensors)
         if not isinstance(A, list) or len(A) != num_tensors:
             raise ValueError(f"A must be a list containing {num_tensors} tensors")
 
@@ -1077,8 +996,7 @@ class NPUBackend(TEFLBackendBase):
             expected_d_cols = weight_rows if layout == "TN" else weight_cols
             if b_cols != expected_b_cols or d_shape != (b_rows, expected_d_cols):
                 raise ValueError(
-                    f"Invalid {layout} shapes: A[0]={tuple(A[0].shape)}, "
-                    f"B={b_shape}, D={d_shape}"
+                    f"Invalid {layout} shapes: A[0]={tuple(A[0].shape)}, B={b_shape}, D={d_shape}"
                 )
             if b_rows == 0:
                 product = torch.zeros_like(d_data)
@@ -1086,9 +1004,7 @@ class NPUBackend(TEFLBackendBase):
                 weight = A[0].transpose(0, 1) if layout == "TN" else A[0]
                 product = torch.matmul(b_data, weight)
             else:
-                weights = (
-                    [tensor.transpose(0, 1) for tensor in A] if layout == "TN" else A
-                )
+                weights = [tensor.transpose(0, 1) for tensor in A] if layout == "TN" else A
                 product = torch_npu.npu_grouped_matmul(
                     [b_data],
                     weights,
@@ -1206,9 +1122,7 @@ class NPUBackend(TEFLBackendBase):
             )
 
         a_data, a_shape, a_group_sizes, num_tensors = self._dense_grouped_tensor_parts(A, "A")
-        b_data, b_shape, b_group_sizes, _ = self._dense_grouped_tensor_parts(
-            B, "B", num_tensors
-        )
+        b_data, b_shape, b_group_sizes, _ = self._dense_grouped_tensor_parts(B, "B", num_tensors)
         if not isinstance(D, list) or len(D) != num_tensors:
             raise ValueError(f"D must be a list containing {num_tensors} tensors")
 
@@ -1682,8 +1596,7 @@ class NPUBackend(TEFLBackendBase):
         layout = ("T" if transa else "N") + ("T" if transb else "N")
         if layout not in ("TN", "NN", "NT"):
             raise NotImplementedError(
-                "NPU grouped-tensor GEMM supports layouts TN, NN, and NT; "
-                f"got {layout}"
+                f"NPU grouped-tensor GEMM supports layouts TN, NN, and NT; got {layout}"
             )
 
         grouped_tensors = {"A": A, "B": B, "D": D}
@@ -1692,13 +1605,10 @@ class NPUBackend(TEFLBackendBase):
 
         num_tensors = getattr(A, "num_tensors", None)
         if not isinstance(num_tensors, int) or num_tensors <= 0:
-            raise ValueError(
-                "NPU grouped-tensor GEMM requires a positive integer A.num_tensors"
-            )
+            raise ValueError("NPU grouped-tensor GEMM requires a positive integer A.num_tensors")
         if num_tensors > 128:
             raise ValueError(
-                "torch_npu.npu_grouped_matmul supports at most 128 groups, "
-                f"got {num_tensors}"
+                f"torch_npu.npu_grouped_matmul supports at most 128 groups, got {num_tensors}"
             )
 
         rowwise_data: dict[str, torch.Tensor] = {}
@@ -1745,8 +1655,7 @@ class NPUBackend(TEFLBackendBase):
                     raise TypeError(f"{name}.first_dims must be a torch.Tensor or None")
                 if first_dims.dtype != torch.int64 or first_dims.numel() != num_tensors:
                     raise ValueError(
-                        f"{name}.first_dims must be an int64 tensor with "
-                        f"{num_tensors} elements"
+                        f"{name}.first_dims must be an int64 tensor with {num_tensors} elements"
                     )
                 if first_dims.device != data.device:
                     raise ValueError(
@@ -1761,8 +1670,7 @@ class NPUBackend(TEFLBackendBase):
         supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
         if input_dtype not in supported_dtypes:
             raise TypeError(
-                "NPU dense grouped-tensor GEMM supports FP16, BF16, and FP32, "
-                f"got {input_dtype}"
+                f"NPU dense grouped-tensor GEMM supports FP16, BF16, and FP32, got {input_dtype}"
             )
         for name in ("B", "D"):
             if rowwise_data[name].device != data_device:
@@ -1782,8 +1690,7 @@ class NPUBackend(TEFLBackendBase):
                 raise TypeError(f"{name} must have dtype torch.float32")
             if coefficient.numel() not in (1, num_tensors):
                 raise ValueError(
-                    f"{name} must contain 1 or {num_tensors} values, "
-                    f"got {coefficient.numel()}"
+                    f"{name} must contain 1 or {num_tensors} values, got {coefficient.numel()}"
                 )
         if alpha.numel() != beta.numel():
             raise ValueError("alpha and beta must contain the same number of values")
@@ -1886,8 +1793,7 @@ class NPUBackend(TEFLBackendBase):
                     raise ValueError("bias_scale must be on the same NPU device as D")
                 if bias_scale.numel() != d_rows:
                     raise ValueError(
-                        f"bias_scale must contain {d_rows} values, "
-                        f"got {bias_scale.numel()}"
+                        f"bias_scale must contain {d_rows} values, got {bias_scale.numel()}"
                     )
 
         # A one-group group_list_type=1 call is rejected by some torch_npu

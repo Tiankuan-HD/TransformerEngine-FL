@@ -210,9 +210,7 @@ def register_builtins(registry) -> None:
             op_name="te_general_grouped_gemm_for_grouped_tensor",
             impl_id="vendor.npu",
             kind=BackendImplKind.VENDOR,
-            fn=_bind_is_available(
-                backend.te_general_grouped_gemm_for_grouped_tensor, is_avail
-            ),
+            fn=_bind_is_available(backend.te_general_grouped_gemm_for_grouped_tensor, is_avail),
             vendor="NPU",
             priority=100,
         ),

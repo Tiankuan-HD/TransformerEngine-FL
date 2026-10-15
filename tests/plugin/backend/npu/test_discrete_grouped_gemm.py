@@ -98,10 +98,7 @@ def test_discrete_in_forward_and_dgrad(layout: str) -> None:
     alpha, beta = _coefficients([1.25, 0.75], [0.5, -0.25], device)
     expected = torch.cat(
         [
-            (
-                products[i].to(dtype).float() * alpha[i]
-                + original_d[i].float() * beta[i]
-            ).to(dtype)
+            (products[i].to(dtype).float() * alpha[i] + original_d[i].float() * beta[i]).to(dtype)
             for i in range(2)
         ],
         dim=0,
@@ -156,12 +153,8 @@ def test_discrete_in_tn_bias_and_bias_scale() -> None:
     alpha, beta = _coefficients([1.0], [0.0], device)
 
     product = torch.cat([x_parts[i] @ weights[i].t() for i in range(2)]).to(dtype)
-    expanded_bias = torch.cat(
-        [bias_parts[0].expand(2, -1), bias_parts[1].expand(3, -1)], dim=0
-    )
-    expected = (
-        product.float() + expanded_bias.float() * bias_scale.view(-1, 1)
-    ).to(dtype)
+    expanded_bias = torch.cat([bias_parts[0].expand(2, -1), bias_parts[1].expand(3, -1)], dim=0)
+    expected = (product.float() + expanded_bias.float() * bias_scale.view(-1, 1)).to(dtype)
 
     NPUBackend().te_general_grouped_gemm_for_discrete_in(
         weights,
@@ -273,8 +266,7 @@ def test_discrete_out_forward_shapes(layout: str) -> None:
     data_ptrs = [tensor.data_ptr() for tensor in d_list]
     alpha, beta = _coefficients([1.0], [0.5], device)
     expected = [
-        (products[i].to(dtype).float() + original_d[i].float() * 0.5).to(dtype)
-        for i in range(2)
+        (products[i].to(dtype).float() + original_d[i].float() * 0.5).to(dtype) for i in range(2)
     ]
 
     returned = NPUBackend().te_general_grouped_gemm_for_discrete_out(
@@ -361,15 +353,9 @@ def test_qwen_expert_routing_with_empty_groups() -> None:
     dtype = torch.bfloat16
     num_experts = 64
     rows = [0 if index % 7 == 0 else index % 3 + 1 for index in range(num_experts)]
-    weights = [
-        torch.randn(3, 4, dtype=dtype, device=device) for _ in range(num_experts)
-    ]
-    x_parts = [
-        torch.randn(row, 4, dtype=dtype, device=device) for row in rows
-    ]
-    dy_parts = [
-        torch.randn(row, 3, dtype=dtype, device=device) for row in rows
-    ]
+    weights = [torch.randn(3, 4, dtype=dtype, device=device) for _ in range(num_experts)]
+    x_parts = [torch.randn(row, 4, dtype=dtype, device=device) for row in rows]
+    dy_parts = [torch.randn(row, 3, dtype=dtype, device=device) for row in rows]
     alpha, beta = _coefficients([1.0], [0.0], device)
     backend = NPUBackend()
 
@@ -470,9 +456,7 @@ def test_discrete_ops_are_registered(monkeypatch: pytest.MonkeyPatch) -> None:
         dy = torch.randn(1, 2, dtype=dtype, device=device)
         alpha, beta = _coefficients([1.0], [0.0], device)
 
-        grouped_forward = _make_grouped(
-            [torch.full((1, 2), torch.nan, dtype=dtype, device=device)]
-        )
+        grouped_forward = _make_grouped([torch.full((1, 2), torch.nan, dtype=dtype, device=device)])
         tex.te_general_grouped_gemm_for_discrete_in(
             [weight],
             True,
