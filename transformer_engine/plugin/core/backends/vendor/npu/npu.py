@@ -89,6 +89,10 @@ class NPUBackend(TEFLBackendBase):
     def is_available(self) -> bool:
         return _check_npu_available()
 
+    def get_cudnn_version(self) -> int:
+        """Return zero because cuDNN is not available on Ascend NPU."""
+        return 0
+
     # ===================== splits_to_offsets adaptation =====================
 
     def splits_to_offsets(
