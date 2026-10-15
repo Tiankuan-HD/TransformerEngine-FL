@@ -36,6 +36,12 @@ from transformer_engine.plugin.core.ops import FlashAttentionBase
 
 import flag_gems
 
+# (to bhsd, back from bhsd) permutations for the dense formats.
+_BHSD_PERMUTES = {
+    "sbhd": ((1, 2, 0, 3), (2, 0, 1, 3)),
+    "bshd": ((0, 2, 1, 3), (0, 2, 1, 3)),
+}
+
 
 class AttnFuncFL(torch.autograd.Function):
     @staticmethod
@@ -72,27 +78,56 @@ class AttnFuncFL(torch.autograd.Function):
         max_logit = None
 
         is_causal = attn_mask_type == "causal"
+        qkv_format = dpa_utils.get_qkv_format(qkv_layout)[0]
 
-        q_permuted = q.permute(1, 2, 0, 3).contiguous()
-        k_permuted = k.permute(1, 2, 0, 3).contiguous()
-        v_permuted = v.permute(1, 2, 0, 3).contiguous()
+        if qkv_format == "thd":
+            # Packed sequences: q/k/v are (t, h, d) and cu_seqlens delimit them,
+            # so "padding_causal" is exactly a causal mask within each sequence.
+            # The dense branch below keeps the narrower test, since it has no
+            # mask to apply the padding half of the mask type with.
+            if window_size is not None and tuple(window_size) not in ((-1, -1), (-1, 0)):
+                raise NotImplementedError(
+                    f"FLAttention does not support sliding window {window_size} for thd"
+                )
+            is_causal = "causal" in attn_mask_type
+            out, softmax_lse, *_ = flag_gems.flash_attention_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
+                dropout_p,
+                is_causal,
+                False,
+                scale=attn_scale,
+            )
+            aux_ctx_tensors = [out, softmax_lse]
+            qkvo_tensors = (q, k, v, out)
+        else:
+            # sbhd / bshd -> bhsd for the dense kernels, and back afterwards.
+            to_bhsd, from_bhsd = _BHSD_PERMUTES[qkv_format]
+            q_permuted = q.permute(*to_bhsd).contiguous()
+            k_permuted = k.permute(*to_bhsd).contiguous()
+            v_permuted = v.permute(*to_bhsd).contiguous()
 
-        (out_permuted, m) = flag_gems.scaled_dot_product_attention_forward(
-            q_permuted,
-            k_permuted,
-            v_permuted,
-            attn_mask=None,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-            scale=attn_scale,
-            enable_gqa=True,
-        )
-        # Must be contiguous for .view() in FlashAttentionFL.forward
-        out = out_permuted.permute(2, 0, 1, 3).contiguous()
+            out_permuted, m = flag_gems.scaled_dot_product_attention_forward(
+                q_permuted,
+                k_permuted,
+                v_permuted,
+                attn_mask=None,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                scale=attn_scale,
+                enable_gqa=True,
+            )
+            # Must be contiguous for .view() in FlashAttentionFL.forward
+            out = out_permuted.permute(*from_bhsd).contiguous()
 
-        aux_ctx_tensors = [out_permuted, m]
+            aux_ctx_tensors = [out_permuted, m]
+            qkvo_tensors = (q_permuted, k_permuted, v_permuted, out_permuted)
         out_ret = out
-        qkvo_tensors = (q_permuted, k_permuted, v_permuted, out_permuted)
 
         nvtx_range_pop(f"{nvtx_label}")
 
@@ -127,6 +162,7 @@ class AttnFuncFL(torch.autograd.Function):
         ctx.is_causal = is_causal
 
         ctx.qkv_layout = qkv_layout
+        ctx.qkv_format = qkv_format
         ctx.attn_mask_type = attn_mask_type
         ctx.window_size = window_size
         ctx.deterministic = deterministic
@@ -168,26 +204,49 @@ class AttnFuncFL(torch.autograd.Function):
             )
             m = m.contiguous() if not m.is_contiguous() else m
 
-            # d_out is (seq, batch, heads, dim) from autograd, permute to (batch, heads, seq, dim)
-            d_out_permuted = d_out.permute(1, 2, 0, 3).contiguous()
+            if ctx.qkv_format == "thd":
+                # For thd the saved tensors are the unpermuted q/k/v/out and
+                # m is the softmax logsumexp from flash_attention_forward.
+                dq, dk, dv = flag_gems.flash_attention_backward(
+                    d_out,
+                    q_permuted,
+                    k_permuted,
+                    v_permuted,
+                    out_permuted,
+                    m,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    ctx.max_seqlen_q,
+                    ctx.max_seqlen_kv,
+                    ctx.dropout_p,
+                    ctx.is_causal,
+                    None,
+                    None,
+                    scale=ctx.attn_scale,
+                )
+            else:
+                to_bhsd, from_bhsd = _BHSD_PERMUTES[ctx.qkv_format]
+                d_out_permuted = d_out.permute(*to_bhsd).contiguous()
 
-            dq_permuted, dk_permuted, dv_permuted = flag_gems.scaled_dot_product_attention_backward(
-                d_out_permuted,
-                q_permuted,
-                k_permuted,
-                v_permuted,
-                out_permuted,
-                m,
-                attn_mask=None,
-                dropout_p=ctx.dropout_p,
-                is_causal=ctx.is_causal,
-                scale=ctx.attn_scale,
-                enable_gqa=True,
-            )
+                dq_permuted, dk_permuted, dv_permuted = (
+                    flag_gems.scaled_dot_product_attention_backward(
+                        d_out_permuted,
+                        q_permuted,
+                        k_permuted,
+                        v_permuted,
+                        out_permuted,
+                        m,
+                        attn_mask=None,
+                        dropout_p=ctx.dropout_p,
+                        is_causal=ctx.is_causal,
+                        scale=ctx.attn_scale,
+                        enable_gqa=True,
+                    )
+                )
 
-            dq = dq_permuted.permute(2, 0, 1, 3)
-            dk = dk_permuted.permute(2, 0, 1, 3)
-            dv = dv_permuted.permute(2, 0, 1, 3)
+                dq = dq_permuted.permute(*from_bhsd)
+                dk = dk_permuted.permute(*from_bhsd)
+                dv = dv_permuted.permute(*from_bhsd)
 
             rest = None
 
