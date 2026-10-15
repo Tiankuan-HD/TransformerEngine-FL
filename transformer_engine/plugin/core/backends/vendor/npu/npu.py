@@ -346,11 +346,7 @@ class NPUBackend(TEFLBackendBase):
         if len(inputs) != len(outputs):
             raise AssertionError("input/output tensor counts must match")
 
-        valid_pairs = [
-            (x, y)
-            for x, y in zip(inputs, outputs)
-            if x.numel() > 0
-        ]
+        valid_pairs = [(x, y) for x, y in zip(inputs, outputs) if x.numel() > 0]
 
         if not valid_pairs:
             return
@@ -359,15 +355,11 @@ class NPUBackend(TEFLBackendBase):
 
         common_dtype = valid_pairs[0][0].dtype
         need_fp32_temp = any(
-            x.dtype != common_dtype or y.dtype != common_dtype
-            for x, y in valid_pairs
+            x.dtype != common_dtype or y.dtype != common_dtype for x, y in valid_pairs
         )
 
         if need_fp32_temp:
-            grads = [
-                x.to(dtype=torch.float32, copy=True)
-                for x, _ in valid_pairs
-            ]
+            grads = [x.to(dtype=torch.float32, copy=True) for x, _ in valid_pairs]
 
         else:
             for x, y in valid_pairs:
