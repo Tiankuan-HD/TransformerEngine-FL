@@ -574,7 +574,7 @@ class NPUBackend(TEFLBackendBase):
                 continue
             step_tensor = torch.tensor(
                 step,
-                dtype=torch.int64,
+                dtype=torch.float32,
                 device=group["params"][0].device,
             )
             fused_adamw(
