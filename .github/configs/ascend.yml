@@ -10,7 +10,7 @@ ci_image: harbor.baai.ac.cn/flagos-dev/transformerengine-fl:85c2523-ascend-dev
 
 # Runner labels for the self-hosted Ascend node
 runner_labels:
-  - hw-4g-cicd-te
+  - flagcicd-910c
 
 # Container volumes
 container_volumes:
@@ -57,7 +57,7 @@ unit_test_matrix:
 
 integration_test_matrix:
   - name: pytorch_mcore_integration
-    path: qa/L1_pytorch_mcore_integration/test.sh
+    path: tests/plugin/backend/ascend/run_integration_tests.sh
 
 # Device types to run tests on
 device_types:

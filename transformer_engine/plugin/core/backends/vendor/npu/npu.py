@@ -89,6 +89,13 @@ class NPUBackend(TEFLBackendBase):
     def is_available(self) -> bool:
         return _check_npu_available()
 
+    def get_num_cublas_streams(self) -> int:
+        return 4
+
+    def get_cudnn_version(self) -> int:
+        """Return zero because cuDNN is not available on Ascend NPU."""
+        return 0
+
     # ===================== splits_to_offsets adaptation =====================
 
     def splits_to_offsets(
@@ -357,6 +364,8 @@ class NPUBackend(TEFLBackendBase):
         opt.multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale)
 
     # NPU backend adaptation: keep the tensor scale on device and use ACLNN AMP foreach.
+
+    @torch.no_grad()
     def multi_tensor_scale_tensor(
         self,
         chunk_size: int,

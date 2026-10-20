@@ -92,7 +92,7 @@ jobs:
     steps:
       - name: Prepare checkout environment
         run: |
-          /usr/bin/git config --global safe.directory '*'
+          /usr/bin/git config --global --replace-all safe.directory '*'
           /usr/bin/git config --global --unset-all credential.helper 2>/dev/null || true
           /usr/bin/git config --system --unset-all credential.helper 2>/dev/null || true
 
@@ -194,6 +194,21 @@ jobs:
 
           [ "$test_exit" -eq 0 ] && [ "$coverage_exit" -eq 0 ]
         timeout-minutes: ${{ inputs.timeout_minutes }}
+
+      - name: Upload test logs and reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: test-reports-${{ inputs.platform }}-${{ inputs.device }}-${{ matrix.test_group.name }}
+          path: |
+            logs/
+            **/*.log
+            **/*.xml
+            **/summary.json
+            **/summary.tsv
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload coverage artifact
         if: ${{ !cancelled() && inputs.coverage_enabled }}
