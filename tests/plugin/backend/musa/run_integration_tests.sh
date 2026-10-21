@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# See LICENSE for license information.
+# MUSA Backend Integration Tests Entry Point
 
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-: "${TE_PATH:=$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/set_env.sh"
 
 export PLATFORM=mthreads
 export TE_FL_PREFER="${TE_FL_PREFER:-vendor}"
@@ -79,4 +78,5 @@ with tempfile.TemporaryDirectory(prefix="te_mcore_musa_") as temp_dir:
 log_stage(f"MUSA collective backend is usable: {backend}")
 PY
 
-exec bash "${TE_PATH}/qa/L1_pytorch_mcore_integration/test.sh"
+echo "Running ${PLATFORM_DISPLAY_NAME} integration tests"
+exec bash "$TE_PATH/$PLATFORM_INTEGRATION_TEST_SCRIPT"
