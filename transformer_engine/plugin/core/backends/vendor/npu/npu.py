@@ -91,6 +91,7 @@ class NPUBackend(TEFLBackendBase):
 
     def get_num_cublas_streams(self) -> int:
         return 4
+
     # ===================== Attention =====================
 
     def get_attention_backend(self, attention_params=None):
