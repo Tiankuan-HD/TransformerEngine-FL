@@ -1,9 +1,3 @@
-"""NPU routing-map candidate; device parity is required before training use.
-
-No TransformerEngineNPU high-level import or custom-op re-registration.
-Token permutation uses raw torch_npu kernels. FP32/BF16 router probabilities keep
-their own differentiable gather, avoiding the installed mixed-dtype wrapper.
-"""
 import torch
 from ...reference.impl.permutation import validate_inputs, validate_restore
 
@@ -35,24 +29,39 @@ def _require_device(tokens):
 
 class _PermuteTokens(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tokens, routing_map, num_out_tokens):
-        output, _, indices = _provider().npu_moe_token_permute_with_routing_map(
-            tokens.contiguous(), routing_map.contiguous(), probs=None,
+    def forward(ctx, tokens, routing_map, probs, num_out_tokens):
+        output, output_probs, indices = _provider().npu_moe_token_permute_with_routing_map(
+            tokens.contiguous(), routing_map.contiguous(), probs=probs,
             num_out_tokens=num_out_tokens, drop_and_pad=False,
         )
         ctx.save_for_backward(indices, routing_map)
         ctx.tokens_num, ctx.experts_num = routing_map.shape
+        ctx.output_shape, ctx.input_dtype = output.shape, tokens.dtype
+        ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(indices)
-        return output, indices
+        return output, output_probs, indices
 
     @staticmethod
-    def backward(ctx, grad_output, _grad_indices):
+    def backward(ctx, grad_output, grad_probs, _grad_indices):
         indices, routing_map = ctx.saved_tensors
-        grad_tokens, _ = _provider().npu_moe_token_permute_with_routing_map_grad(
-            grad_output.contiguous(), None, indices, routing_map,
-            ctx.experts_num, ctx.tokens_num, False,
+        need_tokens = ctx.needs_input_grad[0] and grad_output is not None
+        need_probs = ctx.needs_input_grad[2] and grad_probs is not None
+        if not (need_tokens or need_probs):
+            return None, None, None, None
+        if grad_output is None:
+            grad_output = grad_probs.new_zeros(ctx.output_shape, dtype=ctx.input_dtype)
+        higher_order_probs = need_probs and torch.is_grad_enabled()
+        incoming_probs = grad_probs
+        grad_tokens, grad_probs = _provider().npu_moe_token_permute_with_routing_map_grad(
+            grad_output.contiguous(),
+            grad_probs.contiguous() if need_probs and not higher_order_probs else None,
+            indices, routing_map, ctx.experts_num, ctx.tokens_num, False,
         )
-        return grad_tokens, None, None
+        if higher_order_probs:
+            grad_probs = incoming_probs.new_zeros(routing_map.T.shape).masked_scatter(
+                routing_map.T, incoming_probs
+            ).T
+        return grad_tokens if need_tokens else None, None, grad_probs if need_probs else None, None
 
 
 class _UnpermuteTokens(torch.autograd.Function):
@@ -91,14 +100,10 @@ def moe_permute_with_routing_map(tokens, routing_map, probs=None,
         output = tokens[:0]
         output_probs = None if probs is None else probs.reshape(-1)[:0]
         return output, output_probs, indices
-    output, indices = _PermuteTokens.apply(tokens, routing_map, num_out_tokens)
-    output_probs = None
-    if probs is not None:
-        output_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
-        if output_probs.numel() != num_out_tokens:
-            # Fail, never retry a different backend after a submitted kernel.
-            raise ValueError("routing count differs from num_out_tokens")
-    return output, output_probs, indices
+    output, output_probs, indices = _PermuteTokens.apply(
+        tokens, routing_map, probs, num_out_tokens
+    )
+    return output, output_probs if probs is not None else None, indices
 
 
 def moe_unpermute_with_routing_map(permuted_tokens, sorted_indices, restore_shape,

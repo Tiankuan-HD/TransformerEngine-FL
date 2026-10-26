@@ -11,12 +11,84 @@ by delegating to transformer_engine_npu (pip-installed from TransformerEngineNPU
 from __future__ import annotations
 
 from typing import Any, List, Optional, Tuple, Union
+import functools
 import os
 
 import torch
 
+try:
+    import triton
+    import triton.language as triton_language
+except ImportError:
+    triton = None
+    triton_language = None
+
 from ....ops import TEFLBackendBase, NVTE_Fused_Attn_Backend, DType
 from .flash_attention import NPUFlashAttention
+
+
+if triton is not None:
+
+    @triton.jit(do_not_specialize=["numel"])
+    def _grouped_scalar_epilogue_kernel(
+        product_ptr,
+        destination_ptr,
+        alpha_ptr,
+        beta_ptr,
+        numel,
+        BLOCK: triton_language.constexpr,
+    ):
+        alpha_value = triton_language.load(alpha_ptr)
+        beta_value = triton_language.load(beta_ptr)
+        # Keep MoE lengths dynamic and distribute tiles across Vector Cores.
+        for start in range(
+            triton_language.program_id(0) * BLOCK,
+            numel,
+            triton_language.num_programs(0) * BLOCK,
+        ):
+            offsets = start + triton_language.arange(0, BLOCK)
+            mask = offsets < numel
+            product = triton_language.load(product_ptr + offsets, mask=mask, other=0).to(
+                triton_language.float32
+            )
+            old_destination = triton_language.load(
+                destination_ptr + offsets,
+                mask=mask & (beta_value != 0.0),
+                other=0,
+            ).to(triton_language.float32)
+            result = product * alpha_value + old_destination * beta_value
+            triton_language.store(destination_ptr + offsets, result, mask=mask)
+
+
+@functools.lru_cache(maxsize=None)
+def _npu_epilogue_vector_cores(device_index: int) -> int:
+    properties = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    return max(1, min(int(properties["num_vectorcore"]), 65535))
+
+
+def _apply_grouped_epilogue(
+    product: torch.Tensor,
+    destination: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+) -> bool:
+    """Fuse scalar alpha/beta into one NPU pass when Triton is available."""
+    if triton is None or alpha.numel() != 1 or beta.numel() != 1 or product.numel() == 0:
+        return False
+    block = 8192
+    grid = min(triton.cdiv(product.numel(), block),
+               _npu_epilogue_vector_cores(product.device.index))
+    _grouped_scalar_epilogue_kernel[(grid,)](
+        product,
+        destination,
+        alpha,
+        beta,
+        product.numel(),
+        block,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return True
 
 
 _DTYPE_TO_TORCH = {
@@ -1710,6 +1782,10 @@ class NPUBackend(TEFLBackendBase):
                 f"got {num_tensors}"
             )
 
+        allocate_output = D.rowwise_data is None
+        identity_epilogue = alpha is None and beta is None
+        if allocate_output and not identity_epilogue:
+            raise ValueError("alpha and beta require an initialized output buffer")
         rowwise_data: dict[str, torch.Tensor] = {}
         logical_shapes: dict[str, Tuple[int, int]] = {}
         for name, grouped_tensor in grouped_tensors.items():
@@ -1728,6 +1804,8 @@ class NPUBackend(TEFLBackendBase):
                 )
 
             data = getattr(grouped_tensor, "rowwise_data", None)
+            if name == "D" and allocate_output:
+                data = rowwise_data["A"].new_empty(0, dtype=grouped_tensor.fake_dtype)
             if not isinstance(data, torch.Tensor):
                 raise TypeError(f"{name}.rowwise_data must be a torch.Tensor")
             if data.device.type != "npu":
@@ -1741,7 +1819,9 @@ class NPUBackend(TEFLBackendBase):
             logical_shape = (int(logical_shape[0]), int(logical_shape[1]))
             if logical_shape[0] < 0 or logical_shape[1] <= 0:
                 raise ValueError(f"Invalid {name}.logical_shape: {logical_shape}")
-            if data.numel() != logical_shape[0] * logical_shape[1]:
+            if not (name == "D" and allocate_output) and (
+                data.numel() != logical_shape[0] * logical_shape[1]
+            ):
                 raise ValueError(
                     f"{name}.rowwise_data has {data.numel()} elements, but "
                     f"logical_shape={logical_shape} requires "
@@ -1782,6 +1862,10 @@ class NPUBackend(TEFLBackendBase):
                     f"{name} is {rowwise_data[name].dtype}"
                 )
 
+        if alpha is None:
+            alpha = torch.ones(1, dtype=torch.float32, device=data_device)
+        if beta is None:
+            beta = torch.zeros_like(alpha)
         for name, coefficient in (("alpha", alpha), ("beta", beta)):
             if not isinstance(coefficient, torch.Tensor):
                 raise TypeError(f"{name} must be a torch.Tensor")
@@ -1909,7 +1993,7 @@ class NPUBackend(TEFLBackendBase):
             else:
                 product = torch.matmul(x.transpose(0, 1), weight)
         elif d_rows == 0 or (layout == "NT" and a_rows == 0):
-            product = torch.zeros_like(rowwise_data["D"]).view(d_rows, d_cols)
+            product = torch.zeros((d_rows, d_cols), dtype=input_dtype, device=data_device)
         else:
             torch_npu = _get_torch_npu()
             if layout in ("TN", "NN"):
@@ -1937,14 +2021,17 @@ class NPUBackend(TEFLBackendBase):
                     torch.cumsum(split_sizes, dim=0),
                 )
 
-        if product.numel() != rowwise_data["D"].numel():
+        if product.numel() != d_rows * d_cols:
             raise RuntimeError(
                 "Unexpected NPU grouped GEMM output size: expected "
-                f"{rowwise_data['D'].numel()} elements, got {product.numel()}"
+                f"{d_rows * d_cols} elements, got {product.numel()}"
             )
 
         product_2d = product.reshape(d_rows, d_cols)
-        destination_2d = rowwise_data["D"].view(d_rows, d_cols)
+        if allocate_output:
+            destination_2d = product_2d.to(input_dtype)
+        else:
+            destination_2d = rowwise_data["D"].view(d_rows, d_cols)
 
         def expand_group_values(values: torch.Tensor) -> torch.Tensor:
             if values.numel() == 1:
@@ -1955,11 +2042,16 @@ class NPUBackend(TEFLBackendBase):
                 output_size=d_rows,
             ).view(d_rows, 1)
 
-        # The NPU GEMM result has already been rounded to D's dtype. Perform
-        # the alpha/beta combination in FP32 before the final in-place write.
-        combined = product_2d.float() * expand_group_values(alpha)
-        combined = combined + destination_2d.float() * expand_group_values(beta)
-        destination_2d.copy_(combined.to(destination_2d.dtype))
+        # Keep the alpha/beta combination in FP32, including NT's FP32 GEMM
+        # result, before rounding once to D's dtype for the in-place write.
+        if not (allocate_output and identity_epilogue) and not _apply_grouped_epilogue(
+            product_2d, destination_2d, alpha, beta
+        ):
+            expanded_beta = expand_group_values(beta)
+            old_destination = torch.where(expanded_beta == 0, 0.0, destination_2d.float())
+            combined = product_2d.float() * expand_group_values(alpha)
+            combined = combined + old_destination * expanded_beta
+            destination_2d.copy_(combined.to(destination_2d.dtype))
 
         if bias is not None:
             bias_2d = bias_data.view(num_tensors, d_cols).float()
@@ -1973,6 +2065,8 @@ class NPUBackend(TEFLBackendBase):
                 expanded_bias = expanded_bias * bias_scale.view(d_rows, 1).float()
             destination_2d.copy_((destination_2d.float() + expanded_bias).to(input_dtype))
 
+        if allocate_output:
+            D.rowwise_data = destination_2d.reshape(-1)
         return D
 
 
