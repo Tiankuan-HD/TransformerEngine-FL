@@ -1214,3 +1214,76 @@ class TestNPUGroupedGEMMAccuracy:
         assert torch.allclose(
             npu_D0, ref_D0, atol=1e-2, rtol=1e-2
         ), f"accumulate grouped gemm: max_diff={max_diff:.6e}"
+
+
+@requires_npu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["TN", "NN", "NT"])
+def test_grouped_tensor_result_storage(npu_backend, dtype, layout):
+    """Check all layouts through public dispatch, including output adoption."""
+    from transformer_engine.plugin import tefl
+    from transformer_engine.plugin.core.manager import get_default_manager
+    from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import (
+        GroupedTensorStorage,
+    )
+
+    torch.manual_seed(123)
+    sizes = [3, 0, 5]
+    splits = torch.tensor(sizes, dtype=torch.int64, device="npu")
+    x = torch.randn(8, 32, dtype=dtype, device="npu") * 0.1
+    weight = torch.randn(3, 16, 32, dtype=dtype, device="npu") * 0.1
+
+    def wrap(data, shape, first_dims=None):
+        return GroupedTensorStorage(
+            shape=shape,
+            dtype=dtype,
+            num_tensors=3,
+            quantizer=None,
+            data=None if data is None else data.reshape(-1),
+            first_dims=first_dims,
+        )
+
+    grad = torch.randn(8, 16, dtype=dtype, device="npu") * 0.1
+    xs, dys = x.cpu().float().split(sizes), grad.cpu().float().split(sizes)
+    if layout == "NT":
+        a, b, shape, a_splits, b_splits, d_splits = x, grad, (48, 32), splits, splits, None
+        expected = torch.stack([dy.T @ v for v, dy in zip(xs, dys)]).view(shape)
+    else:
+        a, b = weight, x if layout == "TN" else grad
+        shape, a_splits, b_splits, d_splits = (
+            (8, 16 if layout == "TN" else 32),
+            None,
+            splits,
+            splits,
+        )
+        expected = torch.cat(
+            [
+                v @ (w.T if layout == "TN" else w)
+                for v, w in zip(xs if layout == "TN" else dys, weight.cpu().float())
+            ]
+        )
+    direct = wrap(None, shape, d_splits)
+    explicit = wrap(torch.full(shape, float("nan"), dtype=dtype, device="npu"), shape, d_splits)
+    workspace = torch.empty(0, dtype=torch.uint8, device="npu")
+    alpha, beta = torch.ones(1, device="npu"), torch.zeros(1, device="npu")
+    for output, coefficients in ((direct, (None, None)), (explicit, (alpha, beta))):
+        tefl.te_general_grouped_gemm_for_grouped_tensor(
+            wrap(a, (a.numel() // a.shape[-1], a.shape[-1]), a_splits),
+            layout[0] == "T",
+            wrap(b, (b.numel() // b.shape[-1], b.shape[-1]), b_splits),
+            layout[1] == "T",
+            output,
+            None,
+            None,
+            *coefficients,
+            workspace,
+            workspace,
+            False,
+            0,
+        )
+        assert output.rowwise_data.device.type == "npu"
+        assert (
+            get_default_manager().get_selected_impl_id("te_general_grouped_gemm_for_grouped_tensor")
+            == "vendor.npu"
+        )
+        assert_close(output.rowwise_data.view(shape), expected, dtype)
