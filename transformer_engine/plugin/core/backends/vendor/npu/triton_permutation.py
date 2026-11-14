@@ -52,6 +52,8 @@ def _supports_row_tiles(inp, num_rows, hidden_size):
 
 
 def _row_tile_shape(triton, hidden_size):
+    if hidden_size == 1:
+        return 256, 1
     cols = min(1024, max(32, triton.next_power_of_2(hidden_size)))
     return (4 if cols <= 512 else 2), cols
 
@@ -163,7 +165,7 @@ def make_row_id_map(
         WIDTH=triton.next_power_of_2(num_blocks),
     )
     tokens_per_tile = 16
-    _row_map_write[(min(triton.cdiv(num_tokens, tokens_per_tile), 256),)](
+    _row_map_write[(min(triton.cdiv(num_tokens, tokens_per_tile), 512),)](
         routing_map,
         local_prefix,
         block_offsets,
@@ -325,7 +327,12 @@ def unpermute_with_mask_map(
         from .triton_permutation_kernels import _combine_mask_map_rows
 
         rows, cols = _row_tile_shape(triton, hidden_size)
-        grid = _token_grid(triton.cdiv(num_tokens, rows), triton.cdiv(hidden_size, cols))
+        if merging_probs is None and cols == 1024 and inp.dtype in (torch.float16, torch.bfloat16):
+            # FP32 inputs need the smaller tile to stay within the NPU UB budget.
+            rows = 8
+            grid = (min(triton.cdiv(num_tokens, rows) * triton.cdiv(hidden_size, cols), 768),)
+        else:
+            grid = _token_grid(triton.cdiv(num_tokens, rows), triton.cdiv(hidden_size, cols))
         _combine_mask_map_rows[grid](
             inp,
             row_id_map,

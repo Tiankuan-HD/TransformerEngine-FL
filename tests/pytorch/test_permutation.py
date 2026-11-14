@@ -2007,7 +2007,7 @@ def test_permutation_mask_map_topk1_no_probs(
 @pytest.mark.parametrize("num_tokens", [4096])
 @pytest.mark.parametrize("num_expert", [7, 16])
 @pytest.mark.parametrize("tp_size", [2, 8])
-@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hidden_size", [1, 4096])
 @pytest.mark.parametrize("use_torch_compile", [False, True])
 def test_chunk_permutation(
     te_dtype,

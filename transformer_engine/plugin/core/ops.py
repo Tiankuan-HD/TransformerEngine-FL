@@ -1908,6 +1908,45 @@ class TEFLModule:
     def __all__(self):
         return self.__dir__()
 
+    def is_moe_fusion_available(self, group=None, device=None) -> bool:
+        """Check selected compute implementations and optionally their communicator.
+
+        A group probe may initialize its communicator collectively; every group
+        rank must participate and agree on support before invoking fused compute.
+        """
+        for name in (
+            "moe_alltoallv_grouped_matmul",
+            "moe_grouped_matmul_alltoallv",
+        ):
+            try:
+                fn = self._manager.resolve(name)
+            except RuntimeError:
+                return False
+            if group is not None:
+                supports_group = getattr(fn, "_supports_group", None)
+                if supports_group is None or not supports_group(group, device):
+                    return False
+        return True
+
+    def moe_alltoallv_grouped_matmul(self, x, weights, group, send_counts, recv_counts):
+        """Exchange tokens then multiply expert weights; returns expert-ordered rows.
+
+        Counts are source/destination-by-expert entries. The caller must agree
+        on support across the EP group before invoking this collective.
+        Runtime errors propagate: retrying a collective could desynchronize ranks.
+        """
+        fn = self._manager.resolve("moe_alltoallv_grouped_matmul")
+        return fn(x, weights, group, send_counts, recv_counts)
+
+    def moe_grouped_matmul_alltoallv(self, x, weights, group, send_counts, recv_counts):
+        """Multiply expert weights then return rows in source dispatch order.
+
+        Uses the same count convention as moe_alltoallv_grouped_matmul.
+        Runtime errors propagate without retrying the collective.
+        """
+        fn = self._manager.resolve("moe_grouped_matmul_alltoallv")
+        return fn(x, weights, group, send_counts, recv_counts)
+
     def flash_attention(
         self,
         softmax_scale: float,
