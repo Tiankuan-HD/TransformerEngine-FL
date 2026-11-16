@@ -1354,3 +1354,185 @@ class TestNPUGEMMActivationDimensions:
             if trans_b:
                 dbias_ref = dy_ref.reshape(-1, 64).sum(0).to(dtype)
                 assert_close(dbias, dbias_ref, dtype, msg="bias gradient")
+
+
+def _remainder_master(param, remainder):
+    """Decode TE's BF16/int16 representation on CPU."""
+    high = param.cpu().view(torch.int16).to(torch.int32)
+    low = remainder.cpu().to(torch.int32)
+    return (((high - (low < 0).int()) << 16) | (low & 0xFFFF)).view(torch.float32)
+
+
+def _remainder_adam_expected(tensors, step, mode, bias_correction):
+    """Independent CPU FP32 equations from TE's CUDA remainder Adam functor."""
+    grad, param, moment, variance, remainder = [t.cpu() for t in tensors]
+    master = _remainder_master(param, remainder)
+    beta1, beta2 = torch.tensor(0.9), torch.tensor(0.95)
+    grad = grad.float()
+    if mode == 0:
+        grad = grad + 0.1 * master
+    next_m = beta1 * moment.float() + (1 - beta1) * grad
+    next_v = beta2 * variance.float() + ((1 - beta2) * grad) * grad
+    correction1 = 1 - 0.9**step if bias_correction else 1.0
+    correction2 = 1 - 0.95**step if bias_correction else 1.0
+    update = (next_m / correction1) / ((next_v / correction2).sqrt() + 1e-8)
+    if mode == 1:
+        update = update + 0.1 * master
+    return master - 0.003 * update, next_m.to(moment.dtype), next_v.to(variance.dtype)
+
+
+@requires_npu
+class TestNPURemainderAdam:
+    """Remainder encoding, real vendor dispatch and large-grid regression tests."""
+
+    @pytest.fixture(autouse=True)
+    def vendor_policy(self, monkeypatch):
+        # This branch uses TE_FL_STRICT=0 to propagate kernel errors without fallback.
+        monkeypatch.setenv("TE_FL_STRICT", "0")
+        monkeypatch.setenv("TE_FL_PREFER", "vendor")
+
+    @pytest.mark.parametrize("grad_dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("moment_dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("mode", [0, 1])
+    @pytest.mark.parametrize("bias_correction", [0, 1])
+    def test_matches_cuda_equations(self, grad_dtype, moment_dtype, mode, bias_correction):
+        from transformer_engine.plugin.core import get_manager, get_tefl_module
+
+        torch.manual_seed(37)
+        lists = [[] for _ in range(5)]
+        for shape in [(5, 7), (1025,), (0,)]:
+            n = torch.empty(shape).numel()
+            param = torch.randn(shape).to(torch.bfloat16)
+            low = (
+                torch.tensor([-32768, -1, 0, 1, 32767], dtype=torch.int16)
+                .repeat((n + 4) // 5)[:n]
+                .reshape(shape)
+            )
+            tensors = [
+                torch.randn(shape).to(grad_dtype),
+                param,
+                (torch.randn(shape) * 0.01).to(moment_dtype),
+                (torch.rand(shape) * 0.01 + 1e-5).to(moment_dtype),
+                low,
+            ]
+            for output, tensor in zip(lists, tensors):
+                output.append(tensor.to("npu"))
+        noop = torch.zeros(1, dtype=torch.int32, device="npu")
+        pointers = [[tensor.data_ptr() for tensor in group] for group in lists]
+        gradients = [t.cpu().clone() for t in lists[0]]
+        for step in range(1, 4):
+            expected = [
+                _remainder_adam_expected(tensors, step, mode, bias_correction)
+                for tensors in zip(*lists)
+            ]
+            get_tefl_module().multi_tensor_adam_param_remainder(
+                65536,
+                noop,
+                lists,
+                0.003,
+                0.9,
+                0.95,
+                1e-8,
+                step,
+                mode,
+                bias_correction,
+                0.1,
+            )
+            assert (
+                get_manager().get_selected_impl_id("multi_tensor_adam_param_remainder")
+                == "vendor.npu"
+            )
+            for tensors, (master, moment, variance) in zip(zip(*lists), expected):
+                torch.testing.assert_close(
+                    _remainder_master(tensors[1], tensors[4]), master, atol=2e-7, rtol=3e-6
+                )
+                for actual, reference in [(tensors[2], moment), (tensors[3], variance)]:
+                    torch.testing.assert_close(
+                        actual.cpu().float(),
+                        reference.float(),
+                        atol=2e-7,
+                        rtol=5e-3 if moment_dtype == torch.bfloat16 else 1e-5,
+                    )
+            for grad, original in zip(lists[0], gradients):
+                torch.testing.assert_close(grad.cpu(), original, atol=0, rtol=0)
+        assert [[t.data_ptr() for t in group] for group in lists] == pointers
+
+    def test_noop_and_empty(self, npu_backend):
+        # The no-op branch must not inspect invalid lists or change state.
+        noop = torch.ones(1, dtype=torch.int32, device="npu")
+        npu_backend.multi_tensor_adam_param_remainder(
+            65536, noop, [], 0.003, 0.9, 0.95, 1e-8, 1, 1, 1, 0.1
+        )
+        noop.zero_()
+        npu_backend.multi_tensor_adam_param_remainder(
+            65536, noop, [[], [], [], [], []], 0.003, 0.9, 0.95, 1e-8, 1, 1, 1, 0.1
+        )
+
+    def test_large_tensor_exceeds_65535_tiles(self, npu_backend):
+        n = 65536 * 1024 + 17
+        tensors = [
+            torch.full((n,), 0.125, dtype=torch.float32, device="npu"),
+            torch.full((n,), 0.5, dtype=torch.bfloat16, device="npu"),
+            torch.zeros(n, dtype=torch.bfloat16, device="npu"),
+            torch.zeros(n, dtype=torch.bfloat16, device="npu"),
+            torch.full((n,), -32768, dtype=torch.int16, device="npu"),
+        ]
+        indices = torch.tensor([0, 1023, 1024, 65535 * 1024 - 1, 65535 * 1024, n - 1], device="npu")
+        samples = [t[indices].cpu() for t in tensors]
+        expected = _remainder_adam_expected(samples, 1, 1, 1)
+        noop = torch.zeros(1, dtype=torch.int32, device="npu")
+        torch.npu.synchronize()
+        allocated = torch.npu.memory_allocated()
+        torch.npu.reset_peak_memory_stats()
+        npu_backend.multi_tensor_adam_param_remainder(
+            65536, noop, [[t] for t in tensors], 0.003, 0.9, 0.95, 1e-8, 1, 1, 1, 0.1
+        )
+        torch.npu.synchronize()
+        assert torch.npu.max_memory_allocated() - allocated < 64 * 1024**2
+        samples = [t[indices].cpu() for t in tensors]
+        torch.testing.assert_close(
+            _remainder_master(samples[1], samples[4]), expected[0], atol=2e-7, rtol=3e-6
+        )
+        for actual, reference in zip(samples[2:4], expected[1:]):
+            torch.testing.assert_close(actual, reference)
+
+    @pytest.mark.parametrize("moment_dtype", [torch.bfloat16, torch.float32])
+    def test_fused_adam_optimizer_five_steps(self, moment_dtype):
+        from transformer_engine.plugin.core import get_manager
+        from transformer_engine.pytorch.optimizers import FusedAdam
+
+        param = torch.nn.Parameter(torch.randn(1025, device="npu", dtype=torch.bfloat16))
+        optimizer = FusedAdam(
+            [param],
+            lr=0.003,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.1,
+            master_weights=True,
+            master_weight_dtype=torch.float32,
+            exp_avg_dtype=moment_dtype,
+            exp_avg_sq_dtype=moment_dtype,
+            use_decoupled_grad=True,
+            store_param_remainders=True,
+        )
+        for step in range(1, 6):
+            param.decoupled_grad = torch.full_like(param, 0.125, dtype=torch.float32)
+            state = optimizer.state[param]
+            moment = state.get("exp_avg", torch.zeros_like(param, dtype=moment_dtype))
+            variance = state.get("exp_avg_sq", torch.zeros_like(param, dtype=moment_dtype))
+            remainder = state.get("master_param", torch.zeros_like(param, dtype=torch.int16))
+            expected = _remainder_adam_expected(
+                [param.decoupled_grad, param, moment, variance, remainder], step, 1, 1
+            )
+            optimizer.step()
+            assert (
+                get_manager().get_selected_impl_id("multi_tensor_adam_param_remainder")
+                == "vendor.npu"
+            )
+            state = optimizer.state[param]
+            assert state["master_param"].dtype == torch.int16
+            assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == moment_dtype
+            torch.testing.assert_close(
+                _remainder_master(param, state["master_param"]), expected[0], atol=2e-7, rtol=3e-6
+            )
+            optimizer.zero_grad()

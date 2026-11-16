@@ -125,6 +125,14 @@ def register_builtins(registry) -> None:
             vendor="NPU",
             priority=100,
         ),
+        OpImpl(
+            op_name="multi_tensor_adam_param_remainder",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(backend.multi_tensor_adam_param_remainder, is_avail),
+            vendor="NPU",
+            priority=100,
+        ),
         # Multi-tensor compute scale and scale_inv
         OpImpl(
             op_name="multi_tensor_compute_scale_and_scale_inv",
