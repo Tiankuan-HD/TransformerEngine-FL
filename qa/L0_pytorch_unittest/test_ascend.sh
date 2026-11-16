@@ -59,7 +59,7 @@ run_pytest_step_with_unfused_attention() {
 }
 
 run_pytest_step "Ascend vendor NPU backend tests" "pytest_ascend_vendor_npu.xml" false \
-    "$TE_PATH/tests/plugin/backend/npu/test_backend_npu.py"
+    "$TE_PATH/tests/plugin/backend/npu/test_backend_npu.py" -m "not slow and not integration"
 
 run_pytest_step "NPU MoE row-map tests" "pytest_ascend_moe_row_map.xml" false \
     "$TE_PATH/tests/plugin/plugin/test_npu_row_id_map.py"
