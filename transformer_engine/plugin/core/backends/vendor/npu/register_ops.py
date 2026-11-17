@@ -271,6 +271,24 @@ def register_builtins(registry) -> None:
             )
         )
 
+    from . import permutation
+
+    for name, fn in (
+        ("moe_permute_with_routing_map", permutation.permute),
+        ("moe_unpermute_with_routing_map", permutation.unpermute),
+    ):
+        impls.append(
+            OpImpl(
+                op_name=name,
+                impl_id="vendor.npu.routing_map",
+                kind=BackendImplKind.VENDOR,
+                fn=_bind_is_available(fn, permutation.is_available),
+                vendor="NPU",
+                priority=100,
+                allow_fallback=False,
+            )
+        )
+
     impls.extend(_triton_permutation_impls(is_avail))
 
     registry.register_many(impls)

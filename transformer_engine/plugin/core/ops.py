@@ -1928,6 +1928,29 @@ class TEFLModule:
                     return False
         return True
 
+    def get_moe_permutation_pair(self, tokens, routing_map, probs, num_out_tokens, topk):
+        """Resolve a compatible dropless pair once, or retain the caller's path.
+
+        The caller guarantees fixed positive topk and unweighted combine. Keep
+        the returned callables together: their private indices are not portable
+        to another implementation, even if policy changes before combine.
+        """
+        try:
+            permute = self._manager.resolve_candidates("moe_permute_with_routing_map")[0]
+            unpermute = self._manager.resolve_candidates("moe_unpermute_with_routing_map")[0]
+        except RuntimeError:
+            return None
+        if (permute.kind, permute.vendor, permute.impl_id) != (
+            unpermute.kind,
+            unpermute.vendor,
+            unpermute.impl_id,
+        ):
+            return None
+        supports = getattr(permute.fn, "_supports_inputs", None)
+        if supports is None or not supports(tokens, routing_map, probs, num_out_tokens, topk):
+            return None
+        return permute.fn, unpermute.fn
+
     def moe_alltoallv_grouped_matmul(self, x, weights, group, send_counts, recv_counts):
         """Exchange tokens then multiply expert weights; returns expert-ordered rows.
 
