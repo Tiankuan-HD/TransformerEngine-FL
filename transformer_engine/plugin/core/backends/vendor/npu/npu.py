@@ -628,11 +628,11 @@ class NPUBackend(TEFLBackendBase):
         weight_decay: float,
     ) -> None:
         """Update BF16 weights and int16 remainders without full-size FP32 temporaries."""
-        from .fused_adam import adam_param_remainder
-
         del chunk_size  # The kernel bounds its launch grid independently of CUDA chunking.
         if _noop_requested(noop_flag):
             return
+        from .fused_adam import adam_param_remainder
+
         adam_param_remainder(
             tensor_lists, lr, beta1, beta2, epsilon, step, mode, bias_correction, weight_decay
         )

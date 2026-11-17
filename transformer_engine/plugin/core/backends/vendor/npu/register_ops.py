@@ -132,6 +132,7 @@ def register_builtins(registry) -> None:
             fn=_bind_is_available(backend.multi_tensor_adam_param_remainder, is_avail),
             vendor="NPU",
             priority=100,
+            allow_fallback=False,
         ),
         # Multi-tensor compute scale and scale_inv
         OpImpl(
