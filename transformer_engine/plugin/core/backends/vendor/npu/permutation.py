@@ -105,6 +105,7 @@ class _Unpermute(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         indices, routing_map = ctx.saved_tensors
+        # TorchNPU's non-padding derivative uses sorted_indices for both index arguments.
         tokens_grad, _ = torch_npu.npu_moe_token_unpermute_with_routing_map_grad(
             grad_output.contiguous(),
             indices,

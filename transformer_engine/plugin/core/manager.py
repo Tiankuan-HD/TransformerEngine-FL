@@ -42,7 +42,7 @@ class OpManager:
         self._lock = threading.RLock()
         self._registry = registry or OpRegistry()
         self._state = _OpManagerState()
-        self._dispatch_cache: Dict[Tuple[str, str, int, int, int], OpImpl] = {}
+        self._dispatch_cache: Dict[Tuple[str, str, int, int, int], Callable] = {}
         self._impl_cache: Dict[str, OpImpl] = {}
         self._impl_cache_meta: Dict[str, Tuple[str, int, int, int]] = {}
 
@@ -177,10 +177,6 @@ class OpManager:
         return policy.get_default_order()
 
     def resolve(self, op_name: str) -> Callable:
-        """Return the callable selected for an operator."""
-        return self.resolve_impl(op_name).fn
-
-    def resolve_impl(self, op_name: str) -> OpImpl:
         """
         Resolve and return the best implementation for an operator.
 
@@ -196,7 +192,7 @@ class OpManager:
             op_name: Name of the operator to resolve
 
         Returns:
-            Selected implementation
+            Callable implementation function
 
         Raises:
             RuntimeError: If no implementation found
@@ -282,8 +278,8 @@ class OpManager:
             for key in list(self._dispatch_cache):
                 if key[0] == op_name and key != cache_key:
                     del self._dispatch_cache[key]
-            self._dispatch_cache[cache_key] = chosen
-        return chosen
+            self._dispatch_cache[cache_key] = chosen.fn
+        return chosen.fn
 
     def resolve_candidates(self, op_name: str) -> list[OpImpl]:
         """
@@ -412,21 +408,14 @@ class OpManager:
             impl = self._impl_cache.get(op_name)
         return impl.impl_id if impl else None
 
-    @staticmethod
-    def _log_used(impl: OpImpl) -> None:
-        logger.info_once(
-            f"Op '{impl.op_name}' using '{impl.impl_id}' (kind={impl.kind.value}, vendor={impl.vendor})"
-        )
-
-    def call(self, op_name: str | OpImpl, *args, **kwargs):
+    def call(self, op_name: str, *args, **kwargs):
         """
         Resolve and call an operator implementation with optional fallback support.
 
         Logs on first call or when the implementation changes.
 
         Args:
-            op_name: Operator name, or a previously selected implementation to execute
-                exactly once without reselecting, retrying, or changing the policy cache.
+            op_name: Name of the operator
             *args, **kwargs: Arguments passed to the implementation
 
         Returns:
@@ -435,11 +424,6 @@ class OpManager:
         Raises:
             RuntimeError: If all implementations fail
         """
-        if isinstance(op_name, OpImpl):
-            result = op_name.fn(*args, **kwargs)
-            self._log_used(op_name)
-            return result
-
         enable_fallback = os.getenv("TE_FL_STRICT", "1") != "0"
 
         cached_impl = self._get_cached_impl(op_name)
@@ -469,7 +453,10 @@ class OpManager:
                     self._update_cache(op_name, candidate, selection_metadata)
 
                     if last_impl_id is None:
-                        self._log_used(candidate)
+                        logger.info_once(
+                            f"Op '{op_name}' using '{candidate.impl_id}' "
+                            f"(kind={candidate.kind.value}, vendor={candidate.vendor})"
+                        )
                     elif last_impl_id != candidate.impl_id:
                         logger.info_once(
                             f"Op '{op_name}' switched from '{last_impl_id}' to"
@@ -491,7 +478,10 @@ class OpManager:
                 self._update_cache(op_name, impl, selection_metadata)
 
                 if last_impl_id is None:
-                    self._log_used(impl)
+                    logger.info_once(
+                        f"Op '{op_name}' using '{impl.impl_id}' "
+                        f"(kind={impl.kind.value}, vendor={impl.vendor})"
+                    )
                 elif last_impl_id != impl.impl_id:
                     if idx == 0:
                         logger.info_once(
