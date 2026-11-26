@@ -1281,3 +1281,169 @@ class TestNPUGEMMActivationDimensions:
             if trans_b:
                 dbias_ref = dy_ref.reshape(-1, 64).sum(0).to(dtype)
                 assert_close(dbias, dbias_ref, dtype, msg="bias gradient")
+
+
+@requires_npu
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("heads,width", [(1, 32), (5, 128), (3, 896)])
+def test_mla_interleaved_rope_forward_backward(heads, width, inverse):
+    """Shared KV and multi-head MLA rotate without overwriting saved tensors."""
+    from transformer_engine.plugin.core.manager import get_default_manager
+
+    torch.manual_seed(13)
+    rows = 11
+    x = torch.randn(rows, heads, width, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    angle = torch.randn(rows, 1, width // 2, device=x.device)
+    c, s = (t.to(x.dtype) for t in (angle.cos(), angle.sin()))
+    tables = [torch.cat((t, t), -1).unsqueeze(1) for t in (c, s)]
+    original = x.detach().clone()
+    ref = original.clone().requires_grad_()
+    a, b = ref.float().unflatten(-1, (-1, 2)).unbind(-1)
+    sine = -s if inverse else s
+    expected = torch.stack((a * c - b * sine, b * c + a * sine), dim=-1).reshape_as(ref)
+    output = get_default_manager().call("mla_interleaved_rope", x, *tables, inverse=inverse)
+    dy = torch.randn_like(x)
+    original_dy = dy.clone()
+    (wanted,) = torch.autograd.grad(expected.to(x.dtype), ref, original_dy)
+    (actual,) = torch.autograd.grad(output, x, dy)
+    torch.testing.assert_close(output, expected.to(x.dtype), rtol=0, atol=0)
+    torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(dy, original_dy, rtol=0, atol=0)
+
+
+@requires_npu
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("sink_level", [0.0, 32.0, 110.0])
+def test_packed_csa_teacher_mass_and_masked_gradients(sparse, sink_level):
+    from transformer_engine.plugin.core.backends.vendor.npu import packed_csa
+
+    # All three rows share two compressed keys. Only the first row is valid.
+    device = "npu"
+    iq = torch.ones(3, 1, 4, device=device, requires_grad=True)
+    ik = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]], device=device, requires_grad=True
+    )
+    w = torch.ones(3, 1, device=device, requires_grad=True)
+    kv = torch.zeros(3, 4, device=device)
+    q = torch.zeros(3, 1, 4, device=device)
+    sink = torch.tensor([sink_level], device=device)
+    ids = torch.tensor([[0, 1, 2], [-1, -1, 2], [0, 1, 2]], device=device)
+    padding = torch.tensor([False, False, True], device=device)
+    keys = (
+        ids[:, :2]
+        if sparse
+        else (
+            torch.zeros(3, dtype=torch.int32, device=device),
+            torch.tensor([2, 0, 2], device=device),
+            2,
+        )
+    )
+    _, loss = packed_csa.attention_with_loss(
+        q,
+        kv,
+        sink,
+        ids,
+        1.0,
+        iq,
+        ik,
+        w,
+        kv[:2],
+        keys,
+        1,
+        1.0,
+        padding,
+    )
+    # Non-negligible rows have a uniform teacher. At 32 only dense retains the row.
+    expected = iq.sum() * 0 + ik.sum() * 0 + w.sum() * 0
+    if sink_level == 0 or (not sparse and sink_level == 32):
+        logits = (iq[0] @ ik.T) * w[0]
+        expected = expected - logits.log_softmax(-1).mean() - torch.log(iq.new_tensor(2.0))
+    torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-6)
+    grad_scale = 1.0
+    if not sparse:
+        import math
+
+        mass = 2.0 / (3.0 + math.exp(sink_level))
+        grad_scale = mass / (mass + 1e-10)
+    for actual, wanted in zip(
+        torch.autograd.grad(loss, (iq, ik, w)),
+        torch.autograd.grad(expected * grad_scale, (iq, ik, w)),
+    ):
+        torch.testing.assert_close(actual, wanted, rtol=1e-5, atol=1e-6)
+
+
+@requires_npu
+def test_packed_csa_bf16_topk_near_tie():
+    from transformer_engine.plugin.core.backends.vendor.npu import packed_csa
+
+    device = "npu"
+    q = torch.zeros(1, 2, 128, dtype=torch.bfloat16, device=device)
+    q[0, 0, 0] = q[0, 1, 1] = 1
+    k = torch.zeros(2, 128, dtype=q.dtype, device=device)
+    k[0, 0], k[1, 1] = 130 / 128, 129 / 128
+    w = q.new_tensor([[1.0, 129 / 128]])
+    scale = 128**-0.5
+    dots = (q[0].float() @ k.float().T).relu()
+    upstream = (dots * (w.float() * scale).to(w.dtype).float().T).sum(0)
+    late_scale = (dots * w.float().T).sum(0) * scale
+    assert upstream.argmax().item() == 0 and late_scale.argmax().item() == 1
+    topk = packed_csa.indexer_topk(
+        q,
+        k,
+        w,
+        w.new_tensor([0], dtype=torch.int32),
+        w.new_tensor([2], dtype=torch.int32),
+        2,
+        1,
+        scale,
+    )
+    torch.testing.assert_close(topk.long().flatten(), upstream.argmax().reshape(1))
+    values = torch.tensor([[2.0], [8.0]], device=device, requires_grad=True)
+    query = torch.zeros(1, 1, 1, device=device)
+    sink = torch.zeros(1, device=device)
+    out = packed_csa.attention(query, values, sink, topk, 1.0)
+    old = packed_csa.attention(query, values, sink, late_scale.argmax().reshape(1, 1), 1.0)
+    torch.testing.assert_close(out, query.new_tensor([[1.0]]))
+    torch.testing.assert_close(old, query.new_tensor([[4.0]]))
+    torch.testing.assert_close(
+        torch.autograd.grad(out.sum(), values)[0], values.new_tensor([[0.5], [0.0]])
+    )
+    torch.testing.assert_close(
+        torch.autograd.grad(old.sum(), values)[0], values.new_tensor([[0.0], [0.5]])
+    )
+
+
+@requires_npu
+@pytest.mark.parametrize("sparse", [True, False])
+def test_packed_csa_student_log_probability_clipping(sparse):
+    import math
+    from transformer_engine.plugin.core.backends.vendor.npu import packed_csa
+
+    device = "npu"
+    iq = torch.ones(1, 1, 4, device=device, requires_grad=True)
+    ik = torch.tensor([[0.25, 0.0, 0.0, 0.0], [110.25, 0.0, 0.0, 0.0]], device=device)
+    ids = torch.tensor([[0, 1]], device=device)
+    q = torch.zeros_like(iq)
+    kv = torch.zeros(2, 4, device=device)
+    weights = torch.ones(1, 1, device=device)
+    keys = ids if sparse else (ids[:, 0], ids[:, 1] + 1, 2)
+    _, loss = packed_csa.attention_with_loss(
+        q,
+        kv,
+        q.new_zeros(1),
+        ids,
+        1.0,
+        iq,
+        ik,
+        weights,
+        kv,
+        keys,
+        0,
+        1.0,
+        None,
+    )
+    floor = -math.log(torch.finfo(torch.float32).tiny) if sparse else 110.0
+    torch.testing.assert_close(loss, loss.new_tensor(floor / 2 - math.log(2)))
+    (grad,) = torch.autograd.grad(loss, iq)
+    torch.testing.assert_close(grad, torch.zeros_like(iq), atol=1e-6, rtol=0)

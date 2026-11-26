@@ -34,6 +34,7 @@ def register_builtins(registry) -> None:
     Args:
         registry: Registry to register into
     """
+    from . import hadamard, packed_csa, rope
     from .npu import NPUBackend, is_moe_available, supports_moe_group
 
     backend = NPUBackend()
@@ -49,6 +50,51 @@ def register_builtins(registry) -> None:
         return wrapped
 
     impls = [
+        OpImpl(
+            op_name="hadamard_transform",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(hadamard.hadamard_transform, is_avail),
+            vendor="NPU",
+            priority=100,
+            allow_fallback=False,
+        ),
+        OpImpl(
+            op_name="mla_interleaved_rope",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(rope.mla_interleaved_rope, is_avail),
+            vendor="NPU",
+            priority=100,
+            allow_fallback=False,
+        ),
+        OpImpl(
+            op_name="packed_csa_attention",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(packed_csa.attention, is_avail),
+            vendor="NPU",
+            priority=100,
+            allow_fallback=False,
+        ),
+        OpImpl(
+            op_name="packed_csa_indexer_topk",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(packed_csa.indexer_topk, is_avail),
+            vendor="NPU",
+            priority=100,
+            allow_fallback=False,
+        ),
+        OpImpl(
+            op_name="packed_csa_attention_with_loss",
+            impl_id="vendor.npu",
+            kind=BackendImplKind.VENDOR,
+            fn=_bind_is_available(packed_csa.attention_with_loss, is_avail),
+            vendor="NPU",
+            priority=100,
+            allow_fallback=False,
+        ),
         # FlashAttention class getter
         OpImpl(
             op_name="get_flash_attention_class",
